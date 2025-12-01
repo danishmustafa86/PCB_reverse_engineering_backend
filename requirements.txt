@@ -1,0 +1,26 @@
+# FastAPI Backend for AI-based PCB Reverse Engineering System
+# Server Framework
+fastapi>=0.109.0
+uvicorn>=0.27.0
+
+# File Upload Support
+python-multipart>=0.0.6
+
+# Roboflow YOLOv8 Integration (CRITICAL)
+inference-sdk>=0.9.23
+
+# OCR for Component Text Recognition
+easyocr>=1.7.0
+
+# Image Processing
+opencv-python>=4.9.0.80
+numpy>=1.26.2
+Pillow>=10.2.0
+
+# Circuit Graph Building
+networkx>=3.2.1
+
+# Schematic Drawing
+schemdraw>=0.16
+matplotlib>=3.8.2
+
