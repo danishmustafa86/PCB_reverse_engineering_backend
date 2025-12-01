@@ -19,9 +19,12 @@ import shutil
 from datetime import datetime
 from typing import List, Dict, Any
 import logging
+from PIL import Image
 
 # Import our custom services
-from app.services import detector, ocr_service, tracer, schematic_builder
+# NOTE: OCR support is currently disabled; we only use the detector's
+# class predictions for component types/IDs.
+from app.services import detector, tracer, schematic_builder
 from app.utils import image_processing
 
 # Configure logging
@@ -67,11 +70,7 @@ async def startup_event():
     Initialize services on application startup.
     """
     logger.info("Starting PCB Reverse Engineering API...")
-    
-    # Initialize EasyOCR reader (can take a few seconds)
-    logger.info("Initializing OCR service...")
-    ocr_service.initialize_ocr()
-    
+    logger.info("OCR service is DISABLED; using model class names only.")
     logger.info("API startup complete. Ready to process PCB images.")
 
 
@@ -109,10 +108,9 @@ async def analyze_pcb(file: UploadFile = File(...)):
     This endpoint orchestrates the entire PCB analysis pipeline:
     1. Save uploaded image
     2. Detect components using Roboflow YOLOv8
-    3. Run OCR on detected components to get names/values
-    4. Trace copper tracks using OpenCV
-    5. Build circuit graph and generate netlist
-    6. Draw schematic diagram
+    3. Trace copper tracks using OpenCV
+    4. Build circuit graph and generate netlist
+    5. Draw schematic diagram
     
     Args:
         file (UploadFile): PCB image file
@@ -128,21 +126,42 @@ async def analyze_pcb(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, 
                               detail="File must be an image (JPEG, PNG, etc.)")
         
-        # Generate unique filename with timestamp
+        # Generate unique filename with timestamp (keep original extension)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         file_extension = os.path.splitext(file.filename)[1]
         saved_filename = f"pcb_{timestamp}{file_extension}"
-        image_path = os.path.join(UPLOAD_DIR, saved_filename)
-        
-        # Save uploaded file
-        with open(image_path, "wb") as buffer:
+        original_image_path = os.path.join(UPLOAD_DIR, saved_filename)
+
+        # Save uploaded file exactly as received
+        with open(original_image_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        
-        logger.info(f"Saved uploaded image to {image_path}")
+
+        logger.info(f"Saved uploaded image to {original_image_path}")
+
+        # Normalise image format for OpenCV & downstream processing.
+        # Some formats (e.g. AVIF, HEIC) are not supported by cv2, so we
+        # convert them to PNG using Pillow. The ORIGINAL upload is kept for
+        # download/preview; analysis uses 'analysis_image_path'.
+        analysis_image_path = original_image_path
+        try:
+            # Try to load with OpenCV; if this fails we will convert.
+            _ = image_processing.load_image(analysis_image_path)
+        except Exception:
+            logger.info(
+                "Image format not directly supported by OpenCV; converting to PNG "
+                "for analysis."
+            )
+            png_filename = f"pcb_{timestamp}.png"
+            png_path = os.path.join(UPLOAD_DIR, png_filename)
+            with Image.open(original_image_path) as pil_img:
+                pil_img = pil_img.convert("RGB")
+                pil_img.save(png_path, format="PNG")
+            analysis_image_path = png_path
+            logger.info(f"Converted image to PNG for analysis: {analysis_image_path}")
         
         # ===== STEP 1: Component Detection =====
         logger.info("STEP 1: Detecting components with Roboflow YOLOv8 + Slicing...")
-        raw_detection_result = detector.detect_components(image_path)
+        raw_detection_result = detector.detect_components(analysis_image_path)
         detected_components = detector.parse_detections(raw_detection_result)
         
         # Filter low-confidence detections (lower threshold for small components)
@@ -162,30 +181,35 @@ async def analyze_pcb(file: UploadFile = File(...)):
                 }
             )
         
-        # ===== STEP 2: OCR and Component Naming =====
-        logger.info("STEP 2: Running OCR and assigning component names...")
-        
-        # Reset component counters for new analysis
-        ocr_service.reset_counters()
-        
-        # Process each component to get final names
+        # ===== STEP 2: Component Naming from MODEL ONLY (OCR DISABLED) =====
+        logger.info("STEP 2: Assigning component IDs from model class names (OCR disabled)...")
+
+        # Build simple IDs (IC1, resistor3, capacitor2, etc.) based purely on
+        # the detector's class_name output. This exposes the raw model
+        # predictions without any OCR post‑processing.
         components_with_names = []
+        type_counters: Dict[str, int] = {}
+
         for comp in detected_components:
-            # Get component name using OCR or generic ID
-            component_name = ocr_service.get_component_name(image_path, comp)
-            
+            class_name = comp["class_name"] or "component"
+            # normalise to ID‑safe form
+            safe_type = class_name.replace(" ", "_")
+            type_counters.setdefault(safe_type, 0)
+            type_counters[safe_type] += 1
+            comp_id = f"{safe_type}{type_counters[safe_type]}"
+
             components_with_names.append({
-                'id': component_name,
-                'type': comp['class_name'],
-                'confidence': comp['confidence'],
-                'bbox': comp['bbox']
+                "id": comp_id,
+                "type": class_name,
+                "confidence": comp["confidence"],
+                "bbox": comp["bbox"],
             })
-        
-        logger.info(f"Component naming complete: {[c['id'] for c in components_with_names]}")
+
+        logger.info(f"Component IDs assigned from model classes: {[c['id'] for c in components_with_names]}")
         
         # ===== STEP 3: Copper Track Tracing =====
         logger.info("STEP 3: Tracing copper tracks with OpenCV...")
-        binary_track_image = tracer.extract_copper_tracks(image_path, use_copper_color=False)
+        binary_track_image = tracer.extract_copper_tracks(analysis_image_path, use_copper_color=False)
         
         # Save binary track image for debugging
         track_image_path = os.path.join(RESULTS_DIR, f"tracks_{timestamp}.png")
@@ -212,7 +236,7 @@ async def analyze_pcb(file: UploadFile = File(...)):
         schematic_builder.generate_netlist_report(circuit_graph, netlist_path)
         
         # Create annotated image with bounding boxes
-        original_image = image_processing.load_image(image_path)
+        original_image = image_processing.load_image(analysis_image_path)
         annotated_image = image_processing.draw_bounding_boxes(
             original_image, 
             components_with_names,
